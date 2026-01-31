@@ -1,5 +1,4 @@
 python-telegram-bot==21.10
 pillow
-flask[async]     # keeps asgiref for async route bridging
+flask
 gunicorn
-# No uvicorn needed
