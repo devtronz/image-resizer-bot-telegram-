@@ -1,0 +1,4 @@
+python-telegram-bot==21.10      # or latest >=21
+pillow
+flask                           # ← we'll add this
+gunicorn                        # production server
