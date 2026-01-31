@@ -2,6 +2,7 @@
 
 import os
 import logging
+import asyncio
 from io import BytesIO
 
 from flask import Flask, request, Response
@@ -14,38 +15,61 @@ from telegram.ext import (
     ContextTypes,
 )
 from PIL import Image
-import asyncio
 
-# ──────────────────────────────────────── Logging
+# ────────────────────────────────────────────────
+# Logging setup
+# ────────────────────────────────────────────────
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# ──────────────────────────────────────── Config
+# ────────────────────────────────────────────────
+# Configuration & Application initialization
+# ────────────────────────────────────────────────
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
+
 if not TOKEN:
     raise ValueError("TELEGRAM_TOKEN environment variable is not set")
 
-# Create global application
+# Build application
 application = Application.builder().token(TOKEN).build()
 
-# ──────────────────────────────────────── Handlers
+# VERY IMPORTANT for webhook mode
+asyncio.run(application.initialize())
+asyncio.run(application.start())
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# You can also add shutdown later if needed:
+# import atexit
+# atexit.register(lambda: asyncio.run(application.stop()))
+# atexit.register(lambda: asyncio.run(application.shutdown()))
+
+# ────────────────────────────────────────────────
+# Handlers
+# ────────────────────────────────────────────────
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send welcome message"""
     await update.message.reply_text(
-        "Hi! Send me any photo or image file.\n"
-        "Then **reply** to my message with the desired <b>width</b> in pixels\n"
-        "(aspect ratio will be preserved)\n\n"
-        "Examples:  <code>800</code>   <code>1080</code>   <code>500</code>",
-        parse_mode="HTML"
+        "Hi! 👋\n\n"
+        "Send me a photo or image file.\n"
+        "Then **reply** to my response with the desired <b>width</b> in pixels "
+        "(I will keep the aspect ratio).\n\n"
+        "Examples:\n"
+        "• <code>1080</code>\n"
+        "• <code>800</code>\n"
+        "• <code>500</code>",
+        parse_mode="HTML",
+        disable_web_page_preview=True
     )
 
 
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Receive photo / image document and ask for width"""
     message = update.message
 
+    # Get highest quality photo or document
     photo = message.photo[-1] if message.photo else None
     document = message.document
 
@@ -53,11 +77,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("Please send a photo or an image file.")
         return
 
-    # Download file
-    if photo:
-        file = await photo.get_file()
-    else:
-        file = await document.get_file()
+    file = await (photo.get_file() if photo else document.get_file())
 
     bio = BytesIO()
     await file.download_to_memory(out=bio)
@@ -65,29 +85,30 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         img = Image.open(bio)
-        img.load()  # force load
+        img.load()  # make sure it's loaded
     except Exception as e:
-        logger.warning(f"Failed to open image: {e}")
-        await message.reply_text("Sorry, I couldn't open this image 😔")
+        logger.warning(f"Cannot open image: {e}")
+        await message.reply_text("Sorry, I couldn't process this image 😔")
         return
 
-    # Store in user_data
-    context.user_data["last_image"] = img
+    # Store image in context
+    context.user_data["last_image"] = img.copy()  # copy to be safe
     context.user_data["last_image_format"] = img.format or "JPEG"
 
-    reply_text = (
-        f"Image received! Original size: {img.width} × {img.height}\n\n"
-        "Reply to <b>this</b> message with the desired <b>width</b> (in pixels).\n"
-        "I will keep the aspect ratio."
+    await message.reply_text(
+        f"Got it! Original: <b>{img.width} × {img.height}</b>\n\n"
+        "Now reply to <b>this</b> message with the desired <b>width</b> in pixels.\n"
+        "(10–8000 recommended)",
+        parse_mode="HTML"
     )
-    await message.reply_text(reply_text, parse_mode="HTML")
 
 
-async def handle_resize_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_resize_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Resize image when user replies with a number"""
     message = update.message
 
     if not message.reply_to_message:
-        return  # not a reply → ignore
+        return  # ignore messages that are not replies
 
     img: Image.Image = context.user_data.get("last_image")
     if not img:
@@ -97,51 +118,53 @@ async def handle_resize_request(update: Update, context: ContextTypes.DEFAULT_TY
     try:
         width = int(message.text.strip())
         if width < 10 or width > 12000:
-            raise ValueError("Width out of reasonable range")
-    except Exception:
-        await message.reply_text("Please send a valid number (10–12000)")
+            raise ValueError("unreasonable size")
+    except ValueError:
+        await message.reply_text("Please send a number between 10 and 12000.")
         return
 
-    # Calculate height (keep aspect ratio)
-    ratio = width / img.width
-    height = int(img.height * ratio)
+    # Calculate new height
+    new_height = int(img.height * (width / img.width))
+    if new_height < 1:
+        new_height = 1
 
-    if height < 1:
-        height = 1
+    try:
+        resized = img.resize((width, new_height), Image.Resampling.LANCZOS)
+    except Exception as e:
+        logger.error(f"Resize failed: {e}")
+        await message.reply_text("Sorry, resizing failed 😓")
+        return
 
-    # Resize
-    resized_img = img.resize((width, height), Image.Resampling.LANCZOS)
-
-    # Prepare output
-    output_bio = BytesIO()
-    format_ = context.user_data.get("last_image_format", "JPEG")
-    resized_img.save(output_bio, format=format_, quality=92, optimize=True)
-    output_bio.name = f"resized.{format_.lower()}"
-    output_bio.seek(0)
+    # Prepare to send
+    bio = BytesIO()
+    fmt = context.user_data.get("last_image_format", "JPEG")
+    resized.save(bio, format=fmt, quality=92, optimize=True)
+    bio.name = f"resized.{fmt.lower()}"
+    bio.seek(0)
 
     await message.reply_document(
-        document=output_bio,
-        filename=output_bio.name,
-        caption=f"Resized to {width} × {height}"
+        document=bio,
+        filename=bio.name,
+        caption=f"Resized to {width} × {new_height}"
     )
 
-    # Clean up
-    if "last_image" in context.user_data:
-        del context.user_data["last_image"]
-    if "last_image_format" in context.user_data:
-        del context.user_data["last_image_format"]
+    # Cleanup
+    context.user_data.pop("last_image", None)
+    context.user_data.pop("last_image_format", None)
 
 
-# ──────────────────────────────────────── Flask app
+# ────────────────────────────────────────────────
+# Flask application
+# ────────────────────────────────────────────────
 
-app = Flask(__name__)
+flask_app = Flask(__name__)
 
-@app.route('/')
+@flask_app.route('/')
 def index():
-    return "Image Resizer Bot is running!"
+    return "Image Resizer Bot is alive 🚀"
 
 
-@app.route('/webhook', methods=['POST'])
+@flask_app.route('/webhook', methods=['POST'])
 def webhook():
     if request.headers.get('content-type') == 'application/json':
         json_data = request.get_json(silent=True)
@@ -151,20 +174,29 @@ def webhook():
                 try:
                     asyncio.run(application.process_update(update))
                 except Exception as e:
-                    logger.error("Error while processing update", exc_info=True)
-                    # We still return 200 so Telegram doesn't keep retrying
+                    logger.error("Error processing update", exc_info=True)
+                    # We return 200 anyway → Telegram won't retry endlessly
         return Response(status=200)
 
-    return Response("Wrong content type", status=403)
+    return Response("Bad request", status=400)
 
 
-# Register handlers (must be after app definition but before running)
+# Register all handlers
 application.add_handler(CommandHandler("start", start))
-application.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_photo))
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_resize_request))
+application.add_handler(MessageHandler(
+    filters.PHOTO | filters.Document.IMAGE,
+    handle_photo
+))
+application.add_handler(MessageHandler(
+    filters.TEXT & ~filters.COMMAND,
+    handle_resize_request
+))
 
 
-# For local testing only
+# Local development (polling mode)
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(application.run_polling(allowed_updates=Update.ALL_TYPES))
+    print("Starting polling mode for local development...")
+    asyncio.run(application.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=Update.ALL_TYPES
+    ))
