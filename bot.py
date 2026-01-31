@@ -1,4 +1,4 @@
-# bot.py — complete working version for Render + Gunicorn sync
+# bot.py
 
 import os
 import logging
@@ -27,44 +27,47 @@ logger = logging.getLogger(__name__)
 # ──────────────────────────────────────────────── Config
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 if not TOKEN:
-    raise ValueError("TELEGRAM_TOKEN not set")
+    raise ValueError("TELEGRAM_TOKEN environment variable is not set")
 
-# Build app
+# Build application
 application = Application.builder().token(TOKEN).build()
 
-# Persistent event loop (created once)
+# Persistent event loop
 loop = asyncio.get_event_loop()
 
-# Initialize & start PTB once at startup
+# Initialize & start once at startup
 loop.run_until_complete(application.initialize())
 loop.run_until_complete(application.start())
 
-# Optional: shutdown hook (Render restarts often, so not always needed)
+# Optional shutdown (good practice)
 import atexit
 def shutdown():
     loop.run_until_complete(application.stop())
     loop.run_until_complete(application.shutdown())
 atexit.register(shutdown)
 
-# ──────────────────────────────────────────────── Handlers (same as before)
+# ──────────────────────────────────────────────── Handlers
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Hi! 👋 Send me a photo or image file.\n"
-        "Then **reply** to my message with desired <b>width</b> in pixels "
-        "(aspect ratio kept).\n\n"
-        "Examples: <code>1080</code>, <code>800</code>, <code>500</code>",
-        parse_mode="HTML"
+        "Hi! 👋\n\n"
+        "Send me a photo or image file.\n"
+        "Then **reply** to my message with the desired <b>width</b> in pixels "
+        "(aspect ratio will be preserved).\n\n"
+        "Examples: <code>1080</code>  <code>800</code>  <code>500</code>",
+        parse_mode="HTML",
+        disable_web_page_preview=True
     )
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.message
+
     photo = message.photo[-1] if message.photo else None
     document = message.document
 
     if not photo and not (document and document.mime_type and document.mime_type.startswith("image/")):
-        await message.reply_text("Send a photo or image file please.")
+        await message.reply_text("Please send a photo or an image file.")
         return
 
     file = await (photo.get_file() if photo else document.get_file())
@@ -77,36 +80,38 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         img = Image.open(bio)
         img.load()
     except Exception as e:
-        logger.warning(f"Image open failed: {e}")
-        await message.reply_text("Couldn't process this image 😔")
+        logger.warning(f"Failed to open image: {e}")
+        await message.reply_text("Sorry, I couldn't process this image 😔")
         return
 
     context.user_data["last_image"] = img.copy()
     context.user_data["last_image_format"] = img.format or "JPEG"
 
     await message.reply_text(
-        f"Received! Original: <b>{img.width} × {img.height}</b>\n\n"
-        "Reply to <b>this</b> message with desired <b>width</b> (10–8000).",
+        f"Image received! Original size: <b>{img.width} × {img.height}</b>\n\n"
+        "Reply to <b>this</b> message with the desired <b>width</b> in pixels.\n"
+        "(recommended: 10–8000)",
         parse_mode="HTML"
     )
 
 
 async def handle_resize_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.message
+
     if not message.reply_to_message:
         return
 
     img: Image.Image = context.user_data.get("last_image")
     if not img:
-        await message.reply_text("No recent image. Send one first.")
+        await message.reply_text("No recent image found. Please send a photo first.")
         return
 
     try:
         width = int(message.text.strip())
         if width < 10 or width > 12000:
-            raise ValueError
+            raise ValueError("Size out of range")
     except ValueError:
-        await message.reply_text("Send a number 10–12000.")
+        await message.reply_text("Please send a number between 10 and 12000.")
         return
 
     height = int(img.height * (width / img.width))
@@ -117,7 +122,7 @@ async def handle_resize_request(update: Update, context: ContextTypes.DEFAULT_TY
         resized = img.resize((width, height), Image.Resampling.LANCZOS)
     except Exception as e:
         logger.error(f"Resize failed: {e}")
-        await message.reply_text("Resize failed 😓")
+        await message.reply_text("Sorry, resizing failed 😓")
         return
 
     bio = BytesIO()
@@ -129,9 +134,10 @@ async def handle_resize_request(update: Update, context: ContextTypes.DEFAULT_TY
     await message.reply_document(
         document=bio,
         filename=bio.name,
-        caption=f"Resized → {width} × {height}"
+        caption=f"Resized to {width} × {height}"
     )
 
+    # Cleanup
     context.user_data.pop("last_image", None)
     context.user_data.pop("last_image_format", None)
 
@@ -142,13 +148,13 @@ flask_app = Flask(__name__)
 
 @flask_app.route('/')
 def index():
-    return "Bot is running"
+    return "Image Resizer Bot is running"
 
 
 @flask_app.route('/webhook', methods=['POST'])
 def webhook():
     if request.headers.get('content-type') != 'application/json':
-        return Response("Bad content-type", status=400)
+        return Response("Bad request", status=400)
 
     json_data = request.get_json(silent=True)
     if not json_data:
@@ -159,28 +165,54 @@ def webhook():
         return Response(status=200)
 
     try:
-        # Schedule async work safely from sync thread
+        logger.info(f"Processing update {update.update_id} from {update.effective_user.id if update.effective_user else 'unknown'}")
+
         future = asyncio.run_coroutine_threadsafe(
             application.process_update(update),
             loop
         )
-        future.result(timeout=25)  # Wait max 25s — adjust if images are huge
+
+        # Increased timeout – Render cold start + large photo can take time
+        future.result(timeout=60)
+
+        logger.info(f"Update {update.update_id} processed successfully")
+
     except TimeoutError:
-        logger.warning("Update processing timed out")
+        logger.warning(f"Update {update.update_id} timed out after 60 seconds")
+        # Try to send error message if possible
+        try:
+            if update.effective_message:
+                err_future = asyncio.run_coroutine_threadsafe(
+                    update.effective_message.reply_text("Processing took too long – please try again 😔"),
+                    loop
+                )
+                err_future.result(timeout=10)
+        except Exception:
+            pass
+
     except Exception as e:
-        logger.error("Update processing error", exc_info=True)
-        # Return 200 anyway — Telegram won't retry forever
+        logger.error(f"Error processing update {update.update_id}", exc_info=True)
+        # Try fallback reply
+        try:
+            if update.effective_message:
+                err_future = asyncio.run_coroutine_threadsafe(
+                    update.effective_message.reply_text("Something went wrong – try again later"),
+                    loop
+                )
+                err_future.result(timeout=10)
+        except Exception:
+            pass
 
     return Response(status=200)
 
 
-# Add handlers
+# Register handlers
 application.add_handler(CommandHandler("start", start))
 application.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_photo))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_resize_request))
 
 
-# Local testing (polling)
+# Local testing (polling mode)
 if __name__ == "__main__":
-    print("Local polling mode...")
+    print("Starting polling mode for local testing...")
     asyncio.run(application.run_polling(drop_pending_updates=True))
