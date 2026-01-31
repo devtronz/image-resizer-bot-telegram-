@@ -2,4 +2,3 @@ python-telegram-bot==21.10
 pillow
 flask[async]
 gunicorn
-uvicorn[standard]     # ← add this
