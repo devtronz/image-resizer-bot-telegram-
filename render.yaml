@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: image-resizer-bot
+    env: python
+    plan: free                 # or starter if you upgrade
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn -w 1 -k uvicorn.workers.UvicornWorker bot:app --bind 0.0.0.0:$PORT
+    envVars:
+      - key: TELEGRAM_TOKEN
+        sync: false              # you'll set it manually in dashboard
+      - key: PYTHON_VERSION
+        value: 3.12.3
